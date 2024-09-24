@@ -1,0 +1,12 @@
+Flask==2.1.2
+flask-jwt-extended==4.3.0
+flask-cors==3.0.10
+python-dotenv==0.19.2
+numpy==1.21.2
+requests==2.26.0
+scikit-learn==1.0.1
+pydub==0.25.1
+watchdog==2.1.6
+faster-whisper
+ChatTTS
+psycopg2
