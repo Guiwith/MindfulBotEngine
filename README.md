@@ -80,4 +80,4 @@
 
 #### 注意事项：
 
-首次安装faster-whisper和ChatTTSh会安装模型，如遇下载出错请自行百度搜索或提出issue。
+首次安装faster-whisper和ChatTTS会安装模型，如遇下载出错请自行百度搜索或提出issue。
