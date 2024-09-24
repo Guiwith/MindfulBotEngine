@@ -40,7 +40,7 @@
 
 6.创建.env文件：
 
-`JWT_SECRET_KEY='YOUKEY'`
+`JWT_SECRET_KEY='YOURKEY'`
 
 `DB_HOST='localhost'`
 
