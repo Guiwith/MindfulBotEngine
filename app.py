@@ -11,6 +11,8 @@ import os
 import uuid
 from faster_whisper import WhisperModel
 import ChatTTS
+import psycopg2
+import requests
 
 app = Flask(__name__, static_folder='static', static_url_path='/')
 
@@ -118,99 +120,137 @@ def delete_user(user_id):
 
     return jsonify({"msg": "User deleted"})
 
+
+#database
 @app.route('/knowledge_base', methods=['POST'])
-@jwt_required()  # 使用 jwt_required 验证登录用户
+@jwt_required()
 def add_knowledge_base_entry():
-    current_user = get_jwt_identity()  # 获取当前登录用户的身份信息
+    current_user = get_jwt_identity()
     data = request.json.get('data')
     embedding = request.json.get('embedding')
-
     embedding_blob = pickle.dumps(embedding)
 
-    # 获取当前用户的 ID（user_id），如果用户是 admin，可以选择为其他用户添加
-    user_id = current_user['id']  # 假设 current_user 包含用户ID
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # 查询当前用户是否有共享团队
+                cursor.execute('SELECT is_shared FROM teams t JOIN team_members tm ON t.id = tm.team_id WHERE tm.user_id = %s;', (current_user['id'],))
+                team_shared = cursor.fetchall()
 
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                'INSERT INTO knowledge_base (user_id, data, embedding, created_at) VALUES (%s, %s, %s, NOW())',
-                (user_id, data, embedding_blob)
-            )
-            conn.commit()
+                # 如果团队开启共享
+                if any(team['is_shared'] for team in team_shared):
+                    cursor.execute(
+                        'INSERT INTO knowledge_base (user_id, data, embedding, created_at) VALUES (%s, %s, %s, NOW())',
+                        (current_user['id'], data, embedding_blob)
+                    )
+                else:
+                    cursor.execute(
+                        'INSERT INTO knowledge_base (user_id, data, embedding, created_at) VALUES (%s, %s, %s, NOW())',
+                        (current_user['id'], data, embedding_blob)
+                    )
+                conn.commit()
 
-    return jsonify({"msg": "Entry added to knowledge_base"}), 201
+        return jsonify({"msg": "Entry added to knowledge_base"}), 201
+
+    except Exception as e:
+        print(f"数据库错误: {e}")
+        return jsonify({"msg": "Database error", "error": str(e)}), 500
 
 
+# 获取知识库条目
 @app.route('/knowledge_base', methods=['GET'])
 @jwt_required()  # 验证用户身份
 def get_knowledge_base_entries():
     current_user = get_jwt_identity()  # 获取当前用户信息
     search_keyword = request.args.get('keyword', '')
 
-    with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            # 如果是 admin，查询所有数据
-            if current_user['role'] == 'admin':
-                if search_keyword:
-                    cursor.execute(
-                        "SELECT id, user_id, data, embedding, created_at FROM knowledge_base WHERE data ILIKE %s",
-                        ('%' + search_keyword + '%',)
-                    )
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # 如果用户是管理员，查询所有数据
+                if current_user['role'] == 'admin':
+                    if search_keyword:
+                        cursor.execute(
+                            "SELECT id, user_id, data, embedding, created_at FROM knowledge_base WHERE data ILIKE %s",
+                            ('%' + search_keyword + '%',)
+                        )
+                    else:
+                        cursor.execute("SELECT id, user_id, data, embedding, created_at FROM knowledge_base")
                 else:
-                    cursor.execute("SELECT id, user_id, data, embedding, created_at FROM knowledge_base")
-            # 如果是 user，只查询该用户自己的数据
-            else:
-                user_id = current_user['id']
-                if search_keyword:
-                    cursor.execute(
-                        "SELECT id, user_id, data, embedding, created_at FROM knowledge_base WHERE user_id = %s AND data ILIKE %s",
-                        (user_id, '%' + search_keyword + '%')
-                    )
-                else:
-                    cursor.execute(
-                        "SELECT id, user_id, data, embedding, created_at FROM knowledge_base WHERE user_id = %s",
-                        (user_id,)
-                    )
+                    user_id = current_user['id']
 
-            rows = cursor.fetchall()
+                    # 查询用户自己的数据和团队共享的数据
+                    if search_keyword:
+                        cursor.execute(
+                            '''SELECT kb.id, kb.user_id, kb.data, kb.embedding, kb.created_at 
+                            FROM knowledge_base kb
+                            JOIN team_members tm ON kb.user_id = tm.user_id
+                            JOIN teams t ON tm.team_id = t.id
+                            WHERE (tm.team_id IN (SELECT team_id FROM team_members WHERE user_id = %s)
+                            AND kb.data ILIKE %s)''',
+                            (user_id, '%' + search_keyword + '%')
+                        )
+                    else:
+                        cursor.execute(
+                            '''SELECT kb.id, kb.user_id, kb.data, kb.embedding, kb.created_at 
+                            FROM knowledge_base kb
+                            JOIN team_members tm ON kb.user_id = tm.user_id
+                            JOIN teams t ON tm.team_id = t.id
+                            WHERE tm.team_id IN (SELECT team_id FROM team_members WHERE user_id = %s)''',
+                            (user_id,)
+                        )
 
-    entries = [
-        {
-            "id": row["id"],
-            "user_id": row["user_id"],
-            "data": row["data"],
-            "embedding": pickle.loads(row["embedding"]) if row["embedding"] else None,
-            "created_at": row["created_at"]
-        }
-        for row in rows
-    ]
+                rows = cursor.fetchall()
 
-    return jsonify(entries), 200
+        # 使用字典键名来访问查询结果
+        entries = [
+            {
+                "id": row['id'],
+                "user_id": row['user_id'],
+                "data": row['data'],
+                "embedding": pickle.loads(row['embedding']) if row['embedding'] else None,
+                "created_at": row['created_at']
+            }
+            for row in rows
+        ]
+
+        return jsonify(entries), 200
+
+    except Exception as e:
+        print(f"获取知识库条目时出错: {e}")
+        return jsonify({"msg": "Failed to retrieve knowledge base entries", "error": str(e)}), 500
 
 
 @app.route('/knowledge_base/<int:entry_id>', methods=['PUT'])
-@jwt_required()  # 验证用户身份
+@jwt_required()
 def update_knowledge_base_entry(entry_id):
     current_user = get_jwt_identity()
     data = request.json.get('data')
     embedding = request.json.get('embedding')
-
     embedding_blob = pickle.dumps(embedding)
 
     with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            # 获取要更新的条目的所有者（user_id）
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             cursor.execute('SELECT user_id FROM knowledge_base WHERE id = %s', (entry_id,))
             row = cursor.fetchone()
 
             if not row:
                 return jsonify({"msg": "Entry not found"}), 404
 
-            # 如果是 user，但条目不是该用户的，则拒绝更新
-            if current_user['role'] != 'admin' and row['user_id'] != current_user['id']:
+            # 如果是 user，检查条目是否属于该用户或属于其团队且团队开启了共享
+            cursor.execute(
+                '''SELECT t.is_shared
+                FROM teams t
+                JOIN team_members tm ON t.id = tm.team_id
+                WHERE tm.user_id = %s AND t.is_shared = TRUE 
+                AND tm.team_id IN (SELECT team_id FROM team_members WHERE user_id = %s)''',
+                (row['user_id'], current_user['id'])
+            )
+            shared_team = cursor.fetchone()
+
+            if current_user['role'] != 'admin' and row['user_id'] != current_user['id'] and not shared_team:
                 return jsonify({"msg": "Unauthorized to update this entry"}), 403
 
-            # 允许更新
             cursor.execute(
                 'UPDATE knowledge_base SET data = %s, embedding = %s WHERE id = %s',
                 (data, embedding_blob, entry_id)
@@ -220,25 +260,34 @@ def update_knowledge_base_entry(entry_id):
     return jsonify({"msg": "Entry updated"}), 200
 
 
+
 @app.route('/knowledge_base/<int:entry_id>', methods=['DELETE'])
-@jwt_required()  # 验证用户身份
+@jwt_required()
 def delete_knowledge_base_entry(entry_id):
     current_user = get_jwt_identity()
 
     with get_db_connection() as conn:
-        with conn.cursor() as cursor:
-            # 获取要删除的条目的所有者（user_id）
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
             cursor.execute('SELECT user_id FROM knowledge_base WHERE id = %s', (entry_id,))
             row = cursor.fetchone()
 
             if not row:
                 return jsonify({"msg": "Entry not found"}), 404
 
-            # 如果是 user，但条目不是该用户的，则拒绝删除
-            if current_user['role'] != 'admin' and row['user_id'] != current_user['id']:
+            # 如果是 user，检查条目是否属于该用户或属于其团队且团队开启了共享
+            cursor.execute(
+                '''SELECT t.is_shared
+                FROM teams t
+                JOIN team_members tm ON t.id = tm.team_id
+                WHERE tm.user_id = %s AND t.is_shared = TRUE 
+                AND tm.team_id IN (SELECT team_id FROM team_members WHERE user_id = %s)''',
+                (row['user_id'], current_user['id'])
+            )
+            shared_team = cursor.fetchone()
+
+            if current_user['role'] != 'admin' and row['user_id'] != current_user['id'] and not shared_team:
                 return jsonify({"msg": "Unauthorized to delete this entry"}), 403
 
-            # 允许删除
             cursor.execute('DELETE FROM knowledge_base WHERE id = %s', (entry_id,))
             conn.commit()
 
@@ -421,18 +470,38 @@ def text_to_speech():
     if not text:
         return jsonify({'error': 'No text provided'}), 400
 
-    # 定义每段文本的最大字符数（340 字符）
-    max_chunk_size = 340
+    # 定义每段文本的最大字符数
+    max_chunk_size = 100
 
-    # 分割文本为 340 字符的片段
+    # 分割文本为 100 字符的片段
     text_chunks = [text[i:i + max_chunk_size] for i in range(0, len(text), max_chunk_size)]
     
     audio_segments = []
 
+    # 采样一个说话人
+    specific_speaker_embedding = chattts_model.sample_random_speaker()
+
+    # 定义推理参数
+    params_infer_code = ChatTTS.Chat.InferCodeParams(
+        spk_emb=specific_speaker_embedding,  # 使用采样的说话人嵌入
+        temperature=0.3,
+        top_P=0.7,
+        top_K=20,
+    )
+
     # 对每个文本片段进行推理并生成音频
     try:
         for chunk in text_chunks:
-            wavs = chattts_model.infer([chunk])  # 生成音频
+            # 定义句子级别控制的参数
+            params_refine_text = ChatTTS.Chat.RefineTextParams(
+                prompt='[oral_2][laugh_0][break_4]',
+            )
+
+            wavs = chattts_model.infer(
+                [chunk],
+                params_refine_text=params_refine_text,
+                params_infer_code=params_infer_code,
+            )
             if not wavs or len(wavs) == 0:
                 return jsonify({'error': f'No audio data generated for chunk: {chunk}'}), 500
 
@@ -442,16 +511,16 @@ def text_to_speech():
             audio_data = (audio_data * 32767).astype(np.int16)
             audio_segment = AudioSegment(
                 audio_data.tobytes(),
-                frame_rate=24000,       # 设置采样率
-                sample_width=2,         # 设置样本宽度
-                channels=1              # 假设是单声道音频
+                frame_rate=24000,
+                sample_width=2,
+                channels=1
             )
             audio_segments.append(audio_segment)
         
         # 合并所有音频片段
         combined_audio = audio_segments[0]
         for segment in audio_segments[1:]:
-            combined_audio += segment  # 逐个合并音频片段
+            combined_audio += segment
 
         # 定义合并后音频文件名
         audio_filename = f"{uuid.uuid4()}.wav"
@@ -466,9 +535,169 @@ def text_to_speech():
     return jsonify({'audio_url': f"/uploads/{audio_filename}"}), 200
 
 
+
+
 @app.route('/uploads/<filename>')
 def serve_audio(filename):
     return send_from_directory(UPLOAD_FOLDER, filename)
+
+
+# 创建团队
+@app.route('/teams', methods=['POST'])
+@jwt_required()
+def create_team():
+    current_user = get_jwt_identity()
+    team_name = request.json.get('name')
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # 插入新团队并返回团队 ID
+                cursor.execute(
+                    'INSERT INTO teams (name, is_shared, created_at) VALUES (%s, %s, NOW()) RETURNING id;',
+                    (team_name, False)
+                )
+                
+                team_row = cursor.fetchone()
+                
+                # 打印调试信息，确保插入操作正常
+                print(f"Team row: {team_row}")
+                
+                # 使用字典键来获取团队 ID
+                if team_row:
+                    team_id = team_row['id']
+                    # 插入成功后将当前用户添加到团队
+                    cursor.execute(
+                        'INSERT INTO team_members (team_id, user_id) VALUES (%s, %s);',
+                        (team_id, current_user['id'])
+                    )
+                    conn.commit()
+                    return jsonify({"msg": "Team created", "team_id": team_id}), 201
+                else:
+                    return jsonify({"msg": "Failed to create team"}), 500
+
+    except psycopg2.Error as db_error:
+        # 捕获数据库异常并返回具体的错误信息
+        error_message = f"数据库错误: {db_error.pgcode}, {db_error.pgerror}"
+        print(error_message)
+        return jsonify({"msg": "Database error", "error": error_message}), 500
+
+    except Exception as e:
+        # 捕获所有其他异常并返回具体的错误信息
+        print(f"其他错误: {e}")
+        return jsonify({"msg": "Internal server error", "error": str(e)}), 500
+
+
+# 获取用户的团队
+@app.route('/teams', methods=['GET'])
+@jwt_required()
+def get_teams():
+    current_user = get_jwt_identity()
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cursor:
+                # 查询用户所属团队的信息
+                cursor.execute(
+                    'SELECT t.id, t.name, t.is_shared FROM teams t '
+                    'JOIN team_members tm ON t.id = tm.team_id '
+                    'WHERE tm.user_id = %s;', (current_user['id'],)
+                )
+                teams = cursor.fetchall()
+
+        # 使用键访问返回的字典类型结果
+        return jsonify([{"id": team['id'], "name": team['name'], "is_shared": team['is_shared']} for team in teams]), 200
+
+    except Exception as e:
+        print(f"获取团队时出错: {e}")
+        return jsonify({"msg": "Failed to retrieve teams", "error": str(e)}), 500
+
+# 更新团队共享设置
+# 更新团队共享设置
+@app.route('/teams/<int:team_id>', methods=['PUT'])
+@jwt_required()
+def update_team(team_id):
+    current_user = get_jwt_identity()
+    is_shared = request.json.get('is_shared')
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                # 检查用户是否有权限更新该团队
+                cursor.execute('SELECT user_id FROM team_members WHERE team_id = %s AND user_id = %s', (team_id, current_user['id']))
+                user_team = cursor.fetchone()
+
+                if not user_team:
+                    return jsonify({"msg": "Unauthorized to update this team"}), 403
+
+                # 更新团队共享设置
+                cursor.execute('UPDATE teams SET is_shared = %s WHERE id = %s;', (is_shared, team_id))
+                conn.commit()
+
+        return jsonify({"msg": "Team updated"}), 200
+
+    except Exception as e:
+        print(f"更新团队时出错: {e}")
+        return jsonify({"msg": "Failed to update team", "error": str(e)}), 500
+
+
+# 删除团队
+@app.route('/teams/<int:team_id>', methods=['DELETE'])
+@jwt_required()
+def delete_team(team_id):
+    current_user = get_jwt_identity()
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                # 检查用户是否有权限删除该团队
+                cursor.execute('SELECT user_id FROM team_members WHERE team_id = %s AND user_id = %s', (team_id, current_user['id']))
+                user_team = cursor.fetchone()
+
+                if not user_team:
+                    return jsonify({"msg": "Unauthorized to delete this team"}), 403
+
+                # 删除团队
+                cursor.execute('DELETE FROM teams WHERE id = %s;', (team_id,))
+                conn.commit()
+
+        return jsonify({"msg": "Team deleted"}), 200
+
+    except Exception as e:
+        print(f"删除团队时出错: {e}")
+        return jsonify({"msg": "Failed to delete team", "error": str(e)}), 500
+    
+# 加入团队
+@app.route('/teams/<int:team_id>/join', methods=['POST'])
+@jwt_required()
+def join_team(team_id):
+    current_user = get_jwt_identity()
+
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                # 检查团队是否存在
+                cursor.execute('SELECT id FROM teams WHERE id = %s;', (team_id,))
+                team = cursor.fetchone()
+                if not team:
+                    return jsonify({"msg": "Team not found"}), 404
+
+                # 检查用户是否已经在团队中
+                cursor.execute('SELECT * FROM team_members WHERE team_id = %s AND user_id = %s;', (team_id, current_user['id']))
+                membership = cursor.fetchone()
+                if membership:
+                    return jsonify({"msg": "Already a member of this team"}), 400
+
+                # 将用户加入团队
+                cursor.execute('INSERT INTO team_members (team_id, user_id) VALUES (%s, %s);', (team_id, current_user['id']))
+                conn.commit()
+
+        return jsonify({"msg": "Successfully joined the team"}), 201
+
+    except Exception as e:
+        print(f"加入团队时出错: {e}")
+        return jsonify({"msg": "Failed to join team", "error": str(e)}), 500
+
 
 @app.route('/', defaults={'path': ''})
 @app.route('/<path:path>')
@@ -479,6 +708,7 @@ def catch_all(path):
 
     # 否则返回 index.html 让 Vue Router 处理前端路由
     return send_file(os.path.join(app.static_folder, 'index.html'))
+
 
 if __name__ == '__main__':
    app.run(host="0.0.0.0", port=5050,debug=False)

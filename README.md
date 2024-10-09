@@ -2,19 +2,15 @@
 
 ## Mindful Bot Engine-思维bot
 
-使用技术栈：Flask,LangChain,Vue,postgreSQL,ChatTTS,faster-whisper,sklearn。
+使用技术栈：Flask,LangChain,Vue,postgreSQL,ChatTTS,faster-whisper,sklearn,Crawl4AI。
 
 #### 界面展示
 
-![image-20240924163108608](image-20240924163108608.png)
+![image-20241009150410456](image-20241009150410456.png)
 
-![image-20240924163138562](image-20240924163138562.png)
+![image-20241009150516227](image-20241009150516227.png)
 
-![image-20240924163152677](image-20240924163152677.png)
-
-![image-20240924163209919](image-20240924163209919.png)
-
-![image-20240924163229165](image-20240924163229165.png)
+![image-20241009150556482](image-20241009150556482.png)
 
 使用方法：
 
@@ -31,6 +27,8 @@
 3.创建虚拟环境：
 
 `python -m venv MBE`
+
+并激活虚拟环境
 
 4.安装依赖：
 
